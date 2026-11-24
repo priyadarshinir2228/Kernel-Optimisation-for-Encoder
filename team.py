@@ -6,13 +6,20 @@ in input order. The same encode() is called with the whole passage list (offline
 Same weights, same architecture, same maths as reference.py. What changes is HOW it runs:
   O1  FP16 on Tensor Cores, fused QKV projection, PyTorch SDPA attention, no pooler
   O2  length-aware scheduler: sort by token length, token-budget batches, pad each batch to a multiple of 8
+  O2b batches also end where the padded length drops to a lower multiple of 8 (less padding inside big batches)
   O3  host pipeline: tokenise + build batches in a background thread, pinned memory, async copies, one final sync
   O4  optional torch.compile of the layer stack
   O5  CLS-only last layer (keys/values for all tokens, everything else for the CLS row only)
   O7  live path: one query -> fixed length bucket -> CUDA Graph replay
+  P1  precision: FP16 GEMMs/attention with an FP32 residual stream + LayerNorm (DEFAULT_RES32), FP32 GEMM reductions
 
 Every optimisation can be switched off with environment variables, so each phase can be measured on its own
 (see run_ablation.py). PS09_STAGE picks a preset; individual PS09_<FLAG> variables override it.
+
+The organisers run this file WITHOUT any PS09_* variables, so the defaults below are the submitted configuration.
+Hardware is detected at run time (no GPU model is assumed): FP16 needs CUDA, CUDA Graphs / torch.compile / the
+warm-up fall back to the plain path if they fail, and the token budget is halved automatically if warm-up runs out of
+memory on a smaller GPU.
 """
 import os
 import queue
@@ -22,30 +29,43 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+# ---- submitted defaults (scripts/apply_best_config.py --apply edits the first two) ----
+DEFAULT_STAGE = 4
+DEFAULT_TOKEN_BUDGET = 65536
+DEFAULT_RES32 = 1   # FP32 residual stream + LayerNorm on top of FP16 GEMMs: precision safety margin (see TRACKER.md)
+
 MODEL = os.environ.get("PS09_MODEL", "BAAI/bge-base-en-v1.5")
 MAX_LEN = 512
 
 # Stage presets for the ablation study. Stage 0 behaves like reference.py (FP32, pad to 512, batch 32).
+# bucket = O2b: also end a batch where the padded length drops to a lower multiple of 8 (once the batch holds at least
+# MIN_FILL x budget tokens). Stage 4 padding 10.0% -> 3.7% on the 100k practice set (scripts/workload_stats.py).
 STAGES = {
-    0: dict(fp16=0, sort=0, budget=0, overlap=0, cls_only=0, compile=0, graph=0),
-    1: dict(fp16=1, sort=0, budget=0, overlap=0, cls_only=0, compile=0, graph=0),   # O1
-    2: dict(fp16=1, sort=1, budget=1, overlap=0, cls_only=0, compile=0, graph=0),   # + O2
-    3: dict(fp16=1, sort=1, budget=1, overlap=1, cls_only=0, compile=0, graph=1),   # + O3, O7
-    4: dict(fp16=1, sort=1, budget=1, overlap=1, cls_only=1, compile=0, graph=1),   # + O5
-    5: dict(fp16=1, sort=1, budget=1, overlap=1, cls_only=1, compile=1, graph=1),   # + O4
+    0: dict(fp16=0, sort=0, budget=0, bucket=0, overlap=0, cls_only=0, compile=0, graph=0),
+    1: dict(fp16=1, sort=0, budget=0, bucket=0, overlap=0, cls_only=0, compile=0, graph=0),   # O1
+    2: dict(fp16=1, sort=1, budget=1, bucket=1, overlap=0, cls_only=0, compile=0, graph=0),   # + O2
+    3: dict(fp16=1, sort=1, budget=1, bucket=1, overlap=1, cls_only=0, compile=0, graph=1),   # + O3, O7
+    4: dict(fp16=1, sort=1, budget=1, bucket=1, overlap=1, cls_only=1, compile=0, graph=1),   # + O5
+    5: dict(fp16=1, sort=1, budget=1, bucket=1, overlap=1, cls_only=1, compile=1, graph=1),   # + O4
 }
-STAGE = int(os.environ.get("PS09_STAGE", "4"))
+STAGE = int(os.environ.get("PS09_STAGE", DEFAULT_STAGE))
 CFG = dict(STAGES[STAGE])
 for _k in list(CFG):
     if f"PS09_{_k.upper()}" in os.environ:
         CFG[_k] = int(os.environ[f"PS09_{_k.upper()}"])
-TOKEN_BUDGET = int(os.environ.get("PS09_TOKEN_BUDGET", "65536"))  # max (batch x padded length) per batch
+TOKEN_BUDGET = int(os.environ.get("PS09_TOKEN_BUDGET", DEFAULT_TOKEN_BUDGET))  # max (batch x padded length) per batch
+# Experimental precision switches (default off; measured with validate.py before any use):
+BF16 = int(os.environ.get("PS09_BF16", "0"))              # BF16 instead of FP16 (if the GPU supports it)
+RES32 = int(os.environ.get("PS09_RES32", DEFAULT_RES32))  # FP32 residual stream + LayerNorm (precision margin)
+FP16_ACCUM = int(os.environ.get("PS09_FP16_ACCUM", "0"))  # FP16 accumulation in GEMMs (2x on GeForce, less precise)
 FIXED_BATCH = 32                                                    # used when budget batching is off
 CHUNK = int(os.environ.get("PS09_CHUNK", "16384"))                  # texts tokenised per producer step
+MIN_FILL = float(os.environ.get("PS09_MIN_FILL", "0.25"))           # bucket split only once batch >= this x budget
 LIVE_BUCKETS = (32, 64, 128)                                        # CUDA Graph lengths for single queries
 DEBUG = int(os.environ.get("PS09_DEBUG", "0"))                      # 1 = record max |activation| per layer
 
 _S = {}  # module state filled by setup()
+_LOCK = threading.Lock()  # encode() is not re-entrant (shared CUDA Graph buffers); bench.py calls it serially
 
 
 # ----------------------------------------------------------------------------------------------- model
@@ -53,28 +73,33 @@ class Encoder:
     """BERT forward written directly on the checkpoint's weights (so it is independent of the
     transformers version and lets us fuse QKV, choose the attention kernel and trim the last layer)."""
 
-    def __init__(self, hf_model, dtype, device):
+    def __init__(self, hf_model, dtype, device, res32=False):
         self.dtype, self.device = dtype, device
+        # res32: GEMMs and attention in FP16/BF16, but the residual stream and LayerNorms in FP32 (precision fallback;
+        # scripts/precision_study.py: worst-case 1-cos about 3.7x smaller in CPU emulation)
+        self.res32 = bool(res32) and dtype != torch.float32
+        sdt = torch.float32 if self.res32 else dtype   # dtype of the residual stream and LayerNorm parameters
         m = hf_model
         e = m.embeddings
         self.word = e.word_embeddings.weight.detach().to(device, dtype)
         self.pos = e.position_embeddings.weight.detach().to(device, dtype)
         self.typ0 = e.token_type_embeddings.weight[0].detach().to(device, dtype)   # all token_type_ids are 0
-        self.eln = (e.LayerNorm.weight.detach().to(device, dtype), e.LayerNorm.bias.detach().to(device, dtype))
+        self.eln = (e.LayerNorm.weight.detach().to(device, sdt), e.LayerNorm.bias.detach().to(device, sdt))
         self.eps = float(m.config.layer_norm_eps)
         self.heads = m.config.num_attention_heads
         self.layers = []
         for L in m.encoder.layer:
             a, ao = L.attention.self, L.attention.output
             g = lambda t: t.detach().to(device, dtype).contiguous()
+            gs = lambda t: t.detach().to(device, sdt).contiguous()
             self.layers.append(dict(
                 wqkv=g(torch.cat([a.query.weight, a.key.weight, a.value.weight], 0)),
                 bqkv=g(torch.cat([a.query.bias, a.key.bias, a.value.bias], 0)),
                 wo=g(ao.dense.weight), bo=g(ao.dense.bias),
-                ln1=(g(ao.LayerNorm.weight), g(ao.LayerNorm.bias)),
+                ln1=(gs(ao.LayerNorm.weight), gs(ao.LayerNorm.bias)),
                 wi=g(L.intermediate.dense.weight), bi=g(L.intermediate.dense.bias),
                 wf=g(L.output.dense.weight), bf=g(L.output.dense.bias),
-                ln2=(g(L.output.LayerNorm.weight), g(L.output.LayerNorm.bias)),
+                ln2=(gs(L.output.LayerNorm.weight), gs(L.output.LayerNorm.bias)),
             ))
         self.d = self.word.shape[1]
         self.dh = self.d // self.heads
@@ -85,26 +110,30 @@ class Encoder:
 
     def _layer(self, P, h, mask, cls_only):
         B, T, D = h.shape
-        H, dh = self.heads, self.dh
+        H, dh, dt = self.heads, self.dh, self.dtype
+        hc = h.to(dt)  # GEMM input (no-op unless res32)
         if not cls_only:
-            qkv = F.linear(h, P["wqkv"], P["bqkv"]).view(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
+            qkv = F.linear(hc, P["wqkv"], P["bqkv"]).view(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
             q, k, v = qkv[0], qkv[1], qkv[2]
             res = h
         else:  # keys/values need every token; the query and everything after it only the CLS row
-            kv = F.linear(h, P["wqkv"][D:], P["bqkv"][D:]).view(B, T, 2, H, dh).permute(2, 0, 3, 1, 4)
+            kv = F.linear(hc, P["wqkv"][D:], P["bqkv"][D:]).view(B, T, 2, H, dh).permute(2, 0, 3, 1, 4)
             k, v = kv[0], kv[1]
             res = h[:, :1]
-            q = F.linear(res, P["wqkv"][:D], P["bqkv"][:D]).view(B, 1, H, dh).transpose(1, 2)
+            q = F.linear(hc[:, :1], P["wqkv"][:D], P["bqkv"][:D]).view(B, 1, H, dh).transpose(1, 2)
         ctx = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         ctx = ctx.transpose(1, 2).reshape(B, -1, D)
-        x = self._ln(F.linear(ctx, P["wo"], P["bo"]) + res, P["ln1"])
-        y = F.linear(F.gelu(F.linear(x, P["wi"], P["bi"])), P["wf"], P["bf"])  # exact (erf) GELU, as BERT
+        x = self._ln(F.linear(ctx, P["wo"], P["bo"]) + res, P["ln1"])   # FP16 + FP32 -> FP32 when res32
+        y = F.linear(F.gelu(F.linear(x.to(dt), P["wi"], P["bi"])), P["wf"], P["bf"])  # exact (erf) GELU, as BERT
         return self._ln(y + x, P["ln2"])
 
     def forward(self, ids, attn, use_mask=True, cls_only=False):
         """ids, attn: [B, T] int64 on device. Returns L2-normalised CLS embeddings [B, 768] in FP32."""
         T = ids.shape[1]
-        h = self.word[ids] + self.pos[:T] + self.typ0
+        if self.res32:
+            h = self.word[ids].float() + self.pos[:T].float() + self.typ0.float()
+        else:
+            h = self.word[ids] + self.pos[:T] + self.typ0
         h = self._ln(h, self.eln)
         mask = None
         if use_mask:  # additive mask, broadcast over heads and query rows
@@ -120,35 +149,110 @@ class Encoder:
 
 # ----------------------------------------------------------------------------------------------- setup
 def setup():
+    if _S:  # idempotent: bench.py calls setup(), encode() calls it only if nobody did
+        return
     from transformers import AutoModel, AutoTokenizer
-    torch.backends.cuda.matmul.allow_tf32 = False   # keep FP32 stages bit-comparable with the reference
     cuda = torch.cuda.is_available()
+    notes = []
+    if cuda:
+        m = torch.backends.cuda.matmul
+        m.allow_tf32 = False   # keep FP32 stages bit-comparable with the reference
+        # FP32 reductions inside FP16/BF16 GEMMs (cuBLAS split-K may otherwise reduce in half precision)
+        strict = int(os.environ.get("PS09_STRICT_REDUCTION", "1"))
+        m.allow_fp16_reduced_precision_reduction = not strict
+        if hasattr(m, "allow_bf16_reduced_precision_reduction"):
+            m.allow_bf16_reduced_precision_reduction = not strict
+        if FP16_ACCUM:
+            if hasattr(m, "allow_fp16_accumulation"):
+                m.allow_fp16_accumulation = True
+            else:
+                notes.append("PS09_FP16_ACCUM ignored: needs PyTorch >= 2.7")
     device = torch.device("cuda" if cuda else "cpu")
-    dtype = torch.float16 if (CFG["fp16"] and cuda) else torch.float32
+    dtype = torch.float32
+    if CFG["fp16"] and cuda:
+        dtype = torch.float16
+        if BF16:
+            if torch.cuda.is_bf16_supported():
+                dtype = torch.bfloat16
+            else:
+                notes.append("PS09_BF16 ignored: GPU has no BF16 support, using FP16")
     tok = AutoTokenizer.from_pretrained(MODEL)
     hf = AutoModel.from_pretrained(MODEL).float().eval()
-    enc = Encoder(hf, dtype, device)
+    enc = Encoder(hf, dtype, device, res32=RES32)
     del hf
     fast = tok.backend_tokenizer          # Rust tokenizer: batch encoding releases the GIL
-    fast.enable_truncation(MAX_LEN)
+    fast.enable_truncation(MAX_LEN)       # max_length counts [CLS]/[SEP], same as the reference call
     fast.no_padding()
-    _S.update(tok=tok, fast=fast, enc=enc, device=device, dtype=dtype, cuda=cuda,
-              pad_id=tok.pad_token_id or 0, fwd=enc.forward, graphs={})
     torch.set_grad_enabled(False)
+    _S.update(tok=tok, fast=fast, enc=enc, device=device, dtype=dtype, cuda=cuda, notes=notes,
+              pad_id=tok.pad_token_id or 0, fwd=enc.forward, graphs={}, compiled=False)
 
-    if CFG["compile"] and cuda:
-        _S["fwd"] = torch.compile(enc.forward, dynamic=True)
-
-    # warm-up: kernel selection, cuBLAS handles, allocator pools, compile caches
     if cuda:
-        with torch.inference_mode():
-            for T in (8, 16, 32, 64, 128, 256, 512):
-                b = max(1, min(256, TOKEN_BUDGET // T))
-                ids = torch.full((b, T), 101, device=device)
-                _S["fwd"](ids, torch.ones_like(ids), True, bool(CFG["cls_only"]))
-        torch.cuda.synchronize()
+        if CFG["compile"]:
+            try:
+                _S["fwd"] = torch.compile(enc.forward, dynamic=True)
+                _S["compiled"] = True
+            except Exception as ex:  # no Triton / unsupported platform -> eager
+                notes.append(f"torch.compile unavailable, eager used: {ex!r}"[:300])
+        _warmup()
         if CFG["graph"]:
-            _capture_graphs()
+            try:
+                _capture_graphs()
+            except Exception as ex:  # capture unsupported -> the eager path serves single queries
+                _S["graphs"] = {}
+                notes.append(f"CUDA Graph capture failed, eager live path used: {ex!r}"[:300])
+                torch.cuda.synchronize()
+
+
+def _warmup():
+    """Kernel selection, cuBLAS handles, allocator pools, compile caches -- at the real batch shapes, largest
+    first. If the GPU is smaller than expected, halve the token budget until the largest batch fits with headroom."""
+    global TOKEN_BUDGET
+    dev, cls = _S["device"], bool(CFG["cls_only"])
+    total = torch.cuda.get_device_properties(dev).total_memory
+    while True:
+        try:
+            torch.cuda.reset_peak_memory_stats(dev)
+            with torch.inference_mode():
+                for T in (512, 256, 128, 64, 32, 16, 8):
+                    b = max(1, TOKEN_BUDGET // T)
+                    ids = torch.full((b, T), 101, device=dev)
+                    attn = torch.ones_like(ids)
+                    _S["fwd"](ids, attn, True, cls)
+                    if _S["compiled"]:
+                        _S["fwd"](ids, attn, False, cls)  # unmasked variant used by uniform-length batches
+            torch.cuda.synchronize()
+            peak = torch.cuda.max_memory_allocated(dev)
+            if peak > 0.75 * total and TOKEN_BUDGET > 4096:
+                raise torch.cuda.OutOfMemoryError(f"warm-up peak {peak / 2**30:.2f} GiB is over 75% of VRAM")
+            _S["warmup_peak_bytes"] = int(peak)
+            return
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            if TOKEN_BUDGET <= 4096:
+                raise
+            TOKEN_BUDGET //= 2
+            _S["notes"].append(f"token budget reduced to {TOKEN_BUDGET} to fit this GPU")
+        except Exception as ex:
+            if not _S["compiled"]:
+                raise
+            _S["fwd"], _S["compiled"] = _S["enc"].forward, False  # compiler failed at run time -> eager
+            _S["notes"].append(f"torch.compile failed in warm-up, eager used: {ex!r}"[:300])
+
+
+def runtime_info():
+    """What actually runs on this machine (for logs and the report)."""
+    info = {"stage": STAGE, "cfg": dict(CFG), "token_budget": TOKEN_BUDGET, "torch": torch.__version__,
+            "cuda_available": torch.cuda.is_available(), "model": MODEL}
+    if _S:
+        info.update(device=str(_S["device"]), dtype=str(_S["dtype"]).replace("torch.", ""), res32=_S["enc"].res32,
+                    compiled=_S["compiled"], graph_buckets=sorted(_S["graphs"]), notes=list(_S["notes"]))
+        if _S["cuda"]:
+            p = torch.cuda.get_device_properties(_S["device"])
+            info.update(gpu=p.name, compute_capability=f"{p.major}.{p.minor}", vram_gib=round(p.total_memory / 2**30, 2),
+                        cuda_runtime=torch.version.cuda, warmup_peak_gib=round(_S.get("warmup_peak_bytes", 0) / 2**30, 3),
+                        strict_reduction=not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction)
+    return info
 
 
 def _capture_graphs():
@@ -185,17 +289,28 @@ def _plan(lengths):
     order = np.argsort(-lengths, kind="stable") if CFG["sort"] else np.arange(n)
     if not CFG["budget"]:
         return [order[i:i + FIXED_BATCH] for i in range(0, n, FIXED_BATCH)]
+    bucket = CFG["sort"] and CFG.get("bucket", 0)
+    if bucket:
+        neg_p = -((lengths[order] + 7) // 8 * 8)   # ascending, because order is longest first
+        # minimum batch size before a bucket split: MIN_FILL x budget, but never more than a quarter of this call's
+        # tokens (small calls would otherwise be forced into one wide, heavily padded batch)
+        fill_tokens = MIN_FILL * min(TOKEN_BUDGET, int(lengths.sum()) / 4)
     batches, i = [], 0
     while i < n:
         T = _pad8(int(lengths[order[i]])) if CFG["sort"] else MAX_LEN
         b = max(1, TOKEN_BUDGET // T)
-        batches.append(order[i:i + b])
-        i += b
+        end = min(n, i + b)
+        if bucket:  # first row whose padded length is below T, but keep at least MIN_FILL of the budget
+            k = int(np.searchsorted(neg_p, -T, side="right"))
+            end = min(end, max(k, i + max(1, int(fill_tokens // T))))
+        batches.append(order[i:end])
+        i = end
     return batches
 
 
-def _build(enc_list, idx, lengths):
-    """Pad one batch into pinned host tensors. Stage 0/1 pad to 512 like the reference."""
+def _build(enc_list, idx, lengths, offset=0):
+    """Pad one batch into pinned host tensors. Stage 0/1 pad to 512 like the reference.
+    idx indexes enc_list/lengths (chunk-local); the returned index tensor is idx + offset (position in the call)."""
     T = _pad8(int(lengths[idx].max())) if CFG["sort"] or CFG["budget"] else MAX_LEN
     ids = np.full((len(idx), T), _S["pad_id"], dtype=np.int64)
     attn = np.zeros((len(idx), T), dtype=np.int64)
@@ -205,9 +320,10 @@ def _build(enc_list, idx, lengths):
         attn[r, :len(e)] = 1
     uniform = bool(lengths[idx].min() == T)  # no padding at all -> run attention without a mask
     ids_t, attn_t = torch.from_numpy(ids), torch.from_numpy(attn)
-    if _S["cuda"]:
-        ids_t, attn_t = ids_t.pin_memory(), attn_t.pin_memory()
-    return ids_t, attn_t, torch.from_numpy(np.ascontiguousarray(idx)), uniform
+    idx_t = torch.from_numpy(np.ascontiguousarray(idx + offset, dtype=np.int64))
+    if _S["cuda"]:  # pinned (page-locked) host memory -> truly asynchronous host-to-device copies
+        ids_t, attn_t, idx_t = ids_t.pin_memory(), attn_t.pin_memory(), idx_t.pin_memory()
+    return ids_t, attn_t, idx_t, uniform
 
 
 def _tokenise(texts):
@@ -216,18 +332,30 @@ def _tokenise(texts):
     return ids, np.fromiter((len(x) for x in ids), dtype=np.int64, count=len(ids))
 
 
-def _producer(texts, q, offset_chunks):
+def _put(q, item, stop):
+    """Blocking put that gives up if the consumer has stopped (so the thread never hangs after an error)."""
+    while not stop.is_set():
+        try:
+            q.put(item, timeout=0.1)
+            return True
+        except queue.Full:
+            pass
+    return False
+
+
+def _producer(texts, q, offset_chunks, stop):
     """O3: runs in a thread. Tokenises chunk k+1 while the GPU works on chunk k."""
     try:
         for start in offset_chunks:
             part = texts[start:start + CHUNK]
             ids, lengths = _tokenise(part)
             for idx in _plan(lengths):
-                ids_t, attn_t, idx_t, uni = _build(ids, idx, lengths)
-                q.put((ids_t, attn_t, idx_t + start, uni))
-        q.put(None)
+                ids_t, attn_t, idx_t, uni = _build(ids, idx, lengths, offset=start)
+                if not _put(q, (ids_t, attn_t, idx_t, uni), stop):
+                    return
+        _put(q, None, stop)
     except BaseException as ex:  # surface errors in the main thread
-        q.put(ex)
+        _put(q, ex, stop)
 
 
 def _run_batch(ids_t, attn_t, uniform):
@@ -261,14 +389,18 @@ def _encode_live(text):
     return s_out.cpu().numpy()
 
 
-@torch.inference_mode()
 def encode(texts):
     if not _S:
         setup()
     texts = list(texts)
-    N = len(texts)
-    if N == 0:
+    if not texts:
         return np.zeros((0, 768), dtype=np.float32)
+    with _LOCK, torch.inference_mode():
+        return _encode(texts)
+
+
+def _encode(texts):
+    N = len(texts)
     if N == 1 and CFG["graph"] and _S["graphs"]:
         r = _encode_live(texts[0])
         if r is not None:
@@ -276,18 +408,21 @@ def encode(texts):
 
     out = torch.empty((N, 768), dtype=torch.float32, device=_S["device"])
     if CFG["overlap"]:
-        q = queue.Queue(maxsize=64)
-        th = threading.Thread(target=_producer, args=(texts, q, range(0, N, CHUNK)), daemon=True)
+        q, stop = queue.Queue(maxsize=64), threading.Event()
+        th = threading.Thread(target=_producer, args=(texts, q, range(0, N, CHUNK), stop), daemon=True)
         th.start()
-        while True:
-            item = q.get()
-            if item is None:
-                break
-            if isinstance(item, BaseException):
-                raise item
-            ids_t, attn_t, idx_t, uni = item
-            out[idx_t.to(_S["device"], non_blocking=True)] = _run_batch(ids_t, attn_t, uni)
-        th.join()
+        try:
+            while True:
+                item = q.get()
+                if item is None:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+                ids_t, attn_t, idx_t, uni = item
+                out[idx_t.to(_S["device"], non_blocking=True)] = _run_batch(ids_t, attn_t, uni)
+        finally:
+            stop.set()   # on any error the producer exits instead of blocking on a full queue
+            th.join()
     else:
         ids, lengths = _tokenise(texts)
         for idx in _plan(lengths):
